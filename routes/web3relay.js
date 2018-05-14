@@ -11,10 +11,26 @@ var web3;
 
 var BigNumber = require('bignumber.js');
 var etherUnits = require(__lib + "etherUnits.js")
+var async = require('async');
+var abiDecoder = require('abi-decoder');
+
+require( '../db.js' );
+var mongoose = require( 'mongoose' );
+var Contract = mongoose.model( 'Contract' );
+var Transaction = mongoose.model( 'Transaction' );
 
 var getLatestBlocks = require('./index').getLatestBlocks;
 var filterBlocks = require('./filters').filterBlocks;
 var filterTrace = require('./filters').filterTrace;
+
+const ERC20ABI = [{"constant":true,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"tokens","type":"uint256"}],"name":"approve","outputs":[{"name":"success","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[],"name":"totalSupply","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"from","type":"address"},{"name":"to","type":"address"},{"name":"tokens","type":"uint256"}],"name":"transferFrom","outputs":[{"name":"success","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":true,"inputs":[],"name":"_totalSupply","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":true,"inputs":[{"name":"tokenOwner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[],"name":"acceptOwnership","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[],"name":"owner","outputs":[{"name":"","type":"address"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"to","type":"address"},{"name":"tokens","type":"uint256"}],"name":"transfer","outputs":[{"name":"success","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"tokens","type":"uint256"},{"name":"data","type":"bytes"}],"name":"approveAndCall","outputs":[{"name":"success","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[],"name":"newOwner","outputs":[{"name":"","type":"address"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"tokenAddress","type":"address"},{"name":"tokens","type":"uint256"}],"name":"transferAnyERC20Token","outputs":[{"name":"success","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[{"name":"tokenOwner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"remaining","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"_newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"inputs":[],"payable":false,"stateMutability":"nonpayable","type":"constructor"},{"payable":true,"stateMutability":"payable","type":"fallback"},{"anonymous":false,"inputs":[{"indexed":true,"name":"_from","type":"address"},{"indexed":true,"name":"_to","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"from","type":"address"},{"indexed":true,"name":"to","type":"address"},{"indexed":false,"name":"tokens","type":"uint256"}],"name":"Transfer","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"tokenOwner","type":"address"},{"indexed":true,"name":"spender","type":"address"},{"indexed":false,"name":"tokens","type":"uint256"}],"name":"Approval","type":"event"}];
+
+const KnownMethodIDs = {
+  "0xa9059cbb": { type: "ERC20", method: "transfer" },
+  "0x23b872dd": { type: "ERC20", method: "transferFrom" },
+  "0x095ea7b3": { type: "ERC20", method: "approve" },
+  "0xf2fde38b": { type: "ERC20", method: "transferOwnership" }
+};
 
 /*Start config for node connection and sync*/
 var config = {};
@@ -99,12 +115,95 @@ exports.data = function(req, res){
   } else if ("tx_trace" in req.body) {
     var txHash = req.body.tx_trace.toLowerCase();
 
-    web3.trace.transaction(txHash, function(err, tx) {
-      if(err || !tx) {
-        console.error("TraceWeb3 error :" + err)
-        res.write(JSON.stringify({"error": true}));
+    async.waterfall([
+    function(callback) {
+      web3.eth.getTransaction(txHash, function(err, tx) {
+        if(err || !tx) {
+          return callback({error: true, message: 'Transaction not found.'}, null);
+        } else {
+          // call web3.trace.*() for tx.input != "0x" cases
+          callback(tx.input == "0x", tx);
+        }
+      });
+    }, function(tx, callback) {
+      web3.trace.transaction(txHash, function(err, traces) {
+        if(err || !traces) {
+          console.error("TraceWeb3 error :" + err)
+          return callback({ error: true, message: "TraceWeb3 error:" + err }, null);
+        } else {
+          callback(null, tx, traces);
+        }
+      });
+    }, function(tx, traces, callback) {
+      if (tx.to != null) {
+        // detect some known contracts
+        var methodSig = tx.input.substr(0, 10);
+        if (KnownMethodIDs[methodSig]) {
+          // is it a token contract ?
+          if (KnownMethodIDs[methodSig].type == 'ERC20') {
+            var contract = web3.eth.contract(ERC20ABI);
+            var token = contract.at(tx.to);
+            callback(null, tx, traces, contract, token);
+            return;
+          }
+        }
+        Contract.findOne({address: tx.to}).lean(true)
+          .exec(function(err, contractDb) {
+            if (err || !contractDb) {
+              console.log('Contract not found. tx.to = ', tx.to);
+              callback(null, tx, traces, null);
+              return;
+            }
+            var contract = contract.at(tx.to);
+            // return tokenContract only
+            callback(null, tx, traces, contractDb, ((contract.totalSupply && contract.transfer) ? contract : null));
+          });
       } else {
-        res.write(JSON.stringify(filterTrace(tx)));
+        // creation contract case
+        callback(null, tx, traces, null);
+      }
+    }], function(error, tx, traces, contractOrDb, tokenContract) {
+      if (error) {
+        if (error === true)
+          error = { error: true, message: 'normal TX' };
+        res.write(JSON.stringify(error));
+        res.end();
+        return;
+      }
+
+      // check traces for tokenContract
+      if (contractOrDb && tokenContract) {
+        var decimals = 0, decimalsBN, decimalsDivisor = 1;
+        decimals = tokenContract.decimals ? tokenContract.decimals() : 0;
+        if (typeof contractOrDb.abi == "string") {
+          try {
+            abiDecoder.addABI(JSON.parse(contractOrDb.abi));
+          } catch (e) {
+            console.log("Error parsing ABI:", contractOrDb.abi, e);
+          }
+        } else {
+          abiDecoder.addABI(contractOrDb.abi);
+        }
+        // prepare to convert transfer unit
+        decimalsBN = new BigNumber(decimals);
+        decimalsDivisor = new BigNumber(10).pow(decimalsBN);
+
+        var txns = filterTrace(traces);
+        txns.forEach(function(trace) {
+          if(!trace.error && trace.action.input && contractOrDb) {
+            trace.callInfo = abiDecoder.decodeMethod(trace.action.input);
+            if (trace.callInfo.name == 'transfer') {
+              var amount = new BigNumber(trace.callInfo.params[1].value);
+              trace.amount = amount.dividedBy(decimalsDivisor);
+              // replace to address with _to address arg
+              trace.to = trace.callInfo.params[0].value;
+              trace.type = 'transfer';
+            }
+          }
+        });
+        res.write(JSON.stringify(txns));
+      } else {
+        res.write(JSON.stringify(filterTrace(traces)));
       }
       res.end();
     });
@@ -113,17 +212,47 @@ exports.data = function(req, res){
     // need to filter both to and from
     // from block to end block, paging "toAddress":[addr], 
     // start from creation block to speed things up 
-    // TODO: store creation block
-    var filter = {"fromBlock":"0x1d4c00", "toAddress":[addr]};
-    web3.trace.filter(filter, function(err, tx) {
-      if(err || !tx) {
-        console.error("TraceWeb3 error :" + err)
-        res.write(JSON.stringify({"error": true}));
-      } else {
-        res.write(JSON.stringify(filterTrace(tx)));
+
+    async.waterfall([
+      function(callback) {
+        // get the creation transaction.
+        Transaction.findOne({to: addr}).lean(true).sort("blockNumber").exec(function(err, doc) {
+          if (err || !doc) {
+            callback({error: "true", message: "Contract not found"}, null);
+            return;
+          }
+          callback(null, doc);
+        });
       }
-      res.end();
-    }) 
+    ], function(error, transaction, callback) {
+      if (error) {
+        console.error("TraceWeb3 error :", error)
+        res.write(JSON.stringify(error));
+        return;
+      }
+      var minFromBlock = transaction.blockNumber;
+      var fromBlock;
+
+      if (req.body.fromBlock) {
+        var from = parseInt(req.body.fromBlock);
+        if (from < 0) {
+          fromBlock = minFromBlock;
+        } else {
+          fromBlock = Math.min(from, minFromBlock);
+        }
+      }
+
+      var filter = {"fromBlock": web3.toHex(fromBlock), "toAddress":[addr]};
+      web3.trace.filter(filter, function(err, tx) {
+        if(err || !tx) {
+          console.error("TraceWeb3 error :" + err)
+          res.write(JSON.stringify({"error": true}));
+        } else {
+          res.write(JSON.stringify({transactions: filterTrace(tx), createTransaction: transaction}));
+        }
+        res.end();
+      });
+    });
   } else if ("addr" in req.body) {
     var addr = req.body.addr.toLowerCase();
     var options = req.body.options;
@@ -254,4 +383,5 @@ exports.data = function(req, res){
 
 };
 
+exports.web3 = web3;
 exports.eth = web3.eth;
