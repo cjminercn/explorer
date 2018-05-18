@@ -47,8 +47,8 @@ angular.module('BlocksApp').controller('AddressController', function($stateParam
           data: { "addr": $scope.addrHash, "count": count }
         },
         "lengthMenu": [
-                    [10, 20, 50, 100],
-                    [10, 20, 50, 100] // change per page values here
+                    [10, 20, 50, 100, 150, 300, 500, 1000],
+                    [10, 20, 50, 100, 150, 300, 500, 1000] // change per page values here
                 ],
         "pageLength": 20, 
         "order": [
@@ -63,7 +63,7 @@ angular.module('BlocksApp').controller('AddressController', function($stateParam
         "columnDefs": [ 
           { "targets": [ 5 ], "visible": false, "searchable": false },
           {"type": "date", "targets": 6},
-          {"orderable": false, "targets": [0,2,3]},
+          {"orderable": false, "targets": [0,2,3,4]},
           { "render": function(data, type, row) {
                         if (data != $scope.addrHash)
                           return '<a href="/addr/'+data+'">'+data+'</a>'
